@@ -50,6 +50,16 @@ cp .env.example .env   # optional; compose already injects defaults
 docker compose up --build
 ```
 
+If Compose reports `permission denied ... docker.sock`, add your user to the `docker` group and open a new shell:
+
+```bash
+sudo usermod -aG docker "$USER"
+newgrp docker
+docker compose up --build
+```
+
+Alternatively run `sudo docker compose up --build`.
+
 The `gateway` service waits until Postgres is healthy, then runs `app.py` once. Exceptions land on the host at `./exceptions_for_consultant.json` because the container mounts the project directory.
 
 Expected log shape:
