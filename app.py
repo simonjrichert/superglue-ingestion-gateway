@@ -58,6 +58,18 @@ def mask_credit_card(card_str: str) -> str:
     return "****-****-****-****"
 
 
+def _json_safe_errors(errors: list[dict]) -> list[dict]:
+    """Pydantic ctx may contain Exception instances that json.dump cannot encode."""
+    safe = []
+    for error in errors:
+        item = dict(error)
+        ctx = item.get("ctx")
+        if isinstance(ctx, dict):
+            item["ctx"] = {key: str(value) for key, value in ctx.items()}
+        safe.append(item)
+    return safe
+
+
 def fetch_legacy_data():
     conn = None
     last_error = None
@@ -145,7 +157,7 @@ def main():
             exceptions.append(
                 {
                     "raw_record": row,
-                    "validation_errors": err.errors(include_url=False),
+                    "validation_errors": _json_safe_errors(err.errors(include_url=False)),
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "status": "REQUIRES_CONSULTANT_ACTION",
                 }
