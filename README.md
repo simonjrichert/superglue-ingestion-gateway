@@ -60,6 +60,12 @@ docker compose up --build
 
 Alternatively run `sudo docker compose up --build`.
 
+If containers start but the gateway times out talking to `db`, bridge traffic is being filtered. Allow inter-container communication:
+
+```bash
+sudo sysctl -w net.bridge.bridge-nf-call-iptables=0
+```
+
 The `gateway` service waits until Postgres is healthy, then runs `app.py` once. Exceptions land on the host at `./exceptions_for_consultant.json` because the container mounts the project directory.
 
 Expected log shape:
