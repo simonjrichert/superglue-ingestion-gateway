@@ -1,0 +1,8 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+.env
+README.md
+exceptions_for_consultant.json
