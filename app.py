@@ -5,8 +5,11 @@ import time
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from pydantic import BaseModel, EmailStr, field_validator, ValidationError
+from pydantic import ValidationError
 from datetime import datetime, timezone
+
+from mapper import load_mapping, map_object
+from schemas import OBJECT_MODELS
 
 # --- Configuration ---
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -17,34 +20,10 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "secretpassword")
 
 SUPERGLUE_API_URL = os.getenv("SUPERGLUE_API_URL", "http://localhost:8080/api/v1/ingest")
 SUPERGLUE_API_KEY = os.getenv("SUPERGLUE_API_KEY", "sg_live_mock_key_998877")
-
-
-# --- Pydantic Schema ---
-class SanitizedCustomerRecord(BaseModel):
-    customer_id: int
-    company_name: str
-    email: EmailStr
-    account_status: str
-    credit_card_masked: str
-    created_at: str
-
-    @field_validator("account_status")
-    @classmethod
-    def validate_status(cls, v):
-        allowed = ["ACTIVE", "INACTIVE", "PENDING"]
-        upper_val = v.upper()
-        if upper_val not in allowed:
-            raise ValueError(f"Status '{v}' is not a valid enterprise status {allowed}")
-        return upper_val
-
-    @field_validator("created_at")
-    @classmethod
-    def validate_date(cls, v):
-        try:
-            datetime.strptime(v, "%Y-%m-%d")
-            return v
-        except ValueError:
-            raise ValueError(f"Date '{v}' does not match required format YYYY-MM-DD")
+MAPPING_FILE = os.getenv(
+    "MAPPING_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "mapping.yaml"),
+)
 
 
 # --- Helpers ---
@@ -68,6 +47,16 @@ def _json_safe_errors(errors: list[dict]) -> list[dict]:
             item["ctx"] = {key: str(value) for key, value in ctx.items()}
         safe.append(item)
     return safe
+
+
+def _pydantic_errors(object_name: str, err: ValidationError) -> list[dict]:
+    prefixed = []
+    for error in _json_safe_errors(err.errors(include_url=False)):
+        loc = error.get("loc", ())
+        error["target_object"] = object_name
+        error["loc"] = [object_name, *loc]
+        prefixed.append(error)
+    return prefixed
 
 
 def fetch_legacy_data():
@@ -102,17 +91,42 @@ def fetch_legacy_data():
     return [dict(row) for row in rows]
 
 
-def send_to_superglue(clean_records: list[dict]):
-    if not clean_records:
-        print("⚠️ No valid records to send to Superglue.")
+def map_row_to_salesforce(row: dict, mapping: dict) -> tuple[dict | None, list[dict]]:
+    """Transform one legacy row into Salesforce Account + Contact, or collect errors."""
+    errors = []
+    mapped = {}
+
+    for object_spec in mapping["objects"]:
+        object_name = object_spec["name"]
+        payload, mapping_errors = map_object(row, object_spec)
+        if mapping_errors:
+            errors.extend(mapping_errors)
+            continue
+        try:
+            validated = OBJECT_MODELS[object_name].model_validate(payload)
+            mapped[object_name] = validated.model_dump(mode="json")
+        except ValidationError as err:
+            errors.extend(_pydantic_errors(object_name, err))
+
+    if errors or set(mapped) != {obj["name"] for obj in mapping["objects"]}:
+        return None, errors
+    return mapped, []
+
+
+def send_to_superglue(accounts: list[dict], contacts: list[dict]):
+    if not accounts:
+        print("⚠️ No valid Salesforce records to send to Superglue.")
         return
 
     payload = {
         "source_system": "legacy_erp_postgres",
         "target_system": "salesforce_crm",
         "batch_id": f"batch_{int(time.time())}",
-        "record_count": len(clean_records),
-        "data": clean_records,
+        "record_count": len(accounts),
+        "data": {
+            "Account": accounts,
+            "Contact": contacts,
+        },
     }
 
     headers = {
@@ -120,57 +134,57 @@ def send_to_superglue(clean_records: list[dict]):
         "Authorization": f"Bearer {SUPERGLUE_API_KEY}",
     }
 
-    print(f"🚀 Forwarding {len(clean_records)} clean records to Superglue Engine ({SUPERGLUE_API_URL})...")
+    print(
+        f"🚀 Forwarding {len(accounts)} Salesforce Account(s) and "
+        f"{len(contacts)} Contact(s) to Superglue Engine ({SUPERGLUE_API_URL})..."
+    )
     try:
         res = requests.post(SUPERGLUE_API_URL, json=payload, headers=headers, timeout=5)
         print(f"✅ Response [HTTP {res.status_code}]: {res.text}")
     except requests.exceptions.RequestException as e:
         print(f"⚠️ Could not reach Superglue API Endpoint ({e}).")
-        print("💡 Mock Mode Active: Data successfully validated and payload formatted:")
-        print(json.dumps(payload, indent=2))
+        print("💡 Mock Mode Active: Data successfully mapped to Salesforce and payload formatted:")
+        print(json.dumps(payload, indent=2, default=str))
 
 
 # --- Main Pipeline ---
 def main():
-    print("📥 Ingesting legacy data from Postgres...")
+    mapping = load_mapping(MAPPING_FILE)
+    print(
+        f"📥 Ingesting legacy data from Postgres and mapping to "
+        f"{mapping.get('target_system', 'salesforce_crm')}..."
+    )
     raw_rows = fetch_legacy_data()
 
-    valid_records = []
+    accounts = []
+    contacts = []
     exceptions = []
 
     for row in raw_rows:
-        # Pre-process PII
-        masked_card = mask_credit_card(row.get("credit_card"))
+        # Mask PAN before mapping so it never appears on Salesforce objects or in consultant logs.
+        working_row = dict(row)
+        working_row["credit_card"] = mask_credit_card(row.get("credit_card"))
 
-        candidate_payload = {
-            "customer_id": row["id"],
-            "company_name": row["raw_name"],
-            "email": row["email"],
-            "account_status": row["account_status"],
-            "credit_card_masked": masked_card,
-            "created_at": row["created_at"],
-        }
-
-        try:
-            validated = SanitizedCustomerRecord(**candidate_payload)
-            valid_records.append(validated.model_dump())
-        except ValidationError as err:
+        mapped, errors = map_row_to_salesforce(working_row, mapping)
+        if mapped is None:
             exceptions.append(
                 {
-                    "raw_record": row,
-                    "validation_errors": _json_safe_errors(err.errors(include_url=False)),
+                    "raw_record": working_row,
+                    "errors": errors,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "status": "REQUIRES_CONSULTANT_ACTION",
                 }
             )
+            continue
 
-    # Persist Exceptions for Implementation Consultant
+        accounts.append(mapped["Account"])
+        contacts.append(mapped["Contact"])
+
     with open("exceptions_for_consultant.json", "w", encoding="utf-8") as f:
-        json.dump(exceptions, f, indent=2)
+        json.dump(exceptions, f, indent=2, default=str)
     print(f"📋 Isolated {len(exceptions)} exception(s) into 'exceptions_for_consultant.json'")
 
-    # Send Valid Records to Superglue Core
-    send_to_superglue(valid_records)
+    send_to_superglue(accounts, contacts)
 
 
 if __name__ == "__main__":

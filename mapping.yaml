@@ -1,0 +1,46 @@
+# Maps legacy_customers → Salesforce CRM objects.
+# Change this file with the customer; do not hard-code field names in the pipeline.
+
+source: legacy_customers
+target_system: salesforce_crm
+
+objects:
+  - name: Account
+    unique_key: AccountExternalId__c
+    fields:
+      AccountExternalId__c:
+        source: id
+        transform: prefix
+        prefix: "legacy_erp:"
+      Name:
+        source: raw_name
+        transform: trim
+      Type:
+        const: Customer
+      Status__c:
+        source: account_status
+        transform: uppercase
+        map:
+          ACTIVE: Active
+          INACTIVE: Inactive
+        # PENDING and any other legacy code have no Salesforce picklist value.
+      CreatedDate:
+        source: created_at
+        transform: parse_date
+        formats:
+          - "%Y-%m-%d"
+        # credit_card is intentionally unmapped: PAN must not land on Salesforce.
+
+  - name: Contact
+    unique_key: Email
+    fields:
+      AccountExternalId__c:
+        source: id
+        transform: prefix
+        prefix: "legacy_erp:"
+      LastName:
+        source: raw_name
+        transform: trim
+      Email:
+        source: email
+        transform: trim
