@@ -25,6 +25,18 @@ Customer VPC
 
 This repository is a Salesforce example. The same pattern applies to other ERPs (NetSuite, SAP, and so on): swap the target models and `mapping.yaml`, not the pipeline.
 
+## Why I built it this way
+
+I treated this as an on-prem customer POC, not a hosted demo. The Compose stack is a stand-in for a VPC: the gateway container reads the customer's Postgres (`legacy_erp.legacy_customers`) and only then opens an outbound HTTP call. Nothing in the happy path assumes a SaaS connector already has clean REST objects.
+
+I also refused to "fix" the SQL in place. Cleaning `account_status` or `created_at` and posting a slightly nicer `legacy_customers` row is not an implementation. Salesforce does not store `raw_name` or `PENDING`. I mapped each source row into `Account` and `Contact` (`schemas.py`) so the payload is something the target org could actually load. `target_system: salesforce_crm` in the handover body is therefore honest: the objects, field names, and picklists are Salesforce's, not the ERP's.
+
+The field decisions live in `mapping.yaml` on purpose. That file is the written result of sitting with the customer: `id` becomes `AccountExternalId__c` (`legacy_erp:{id}`) so reruns do not duplicate Accounts; `ACTIVE`/`INACTIVE` become `Active`/`Inactive`; `PENDING` has no picklist value so it is parked, not coerced; `credit_card` is not a Salesforce field at all. I did not bury those rules in `if` statements in `app.py`. If the customer later agrees `PENDING` should map, the change is the YAML (and the expected-outcome table below), not a hidden code path.
+
+Failures are scoped to the row, not the batch. Unmapped statuses, bad emails, and unparseable dates go to `exceptions_for_consultant.json` with the Salesforce object, field, source column, and a stable error code (`UNMAPPED_VALUE`, `INVALID_DATE`, …). Valid Accounts/Contacts still forward. I would rather an implementation consultant fix three source rows than push illegal picklist values into Salesforce or abort the whole load because Globex has a broken email.
+
+Safety here is about egress, not a scanner bolted on at the end. I mask PAN on a working copy of the row before mapping, drop `credit_card` from the target schema, and keep the exception log on that same masked copy. The only JSON meant to leave the network is Salesforce-shaped records that never contained a full card number.
+
 ## Salesforce mapping
 
 Legacy `legacy_customers` rows are **not** sent as cleaned SQL. They are transformed into Salesforce objects using `mapping.yaml`:
