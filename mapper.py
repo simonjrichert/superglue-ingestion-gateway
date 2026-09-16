@@ -49,8 +49,18 @@ def load_mapping(path: str) -> dict:
     return mapping
 
 
+_PLACEHOLDERS = {"n/a", "na", "null", "none", "nil"}
+
+
 def _is_empty(value) -> bool:
-    return value is None or (isinstance(value, str) and value.strip() == "")
+    if value is None:
+        return True
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    if stripped == "":
+        return True
+    return stripped.lower() in _PLACEHOLDERS
 
 
 def _transforms(spec: dict) -> list[str]:

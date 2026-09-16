@@ -48,29 +48,38 @@ Legacy `legacy_customers` rows are **not** sent as cleaned SQL. They are transfo
 | —                 | `Account.Type`               | Constant `Customer` |
 | `account_status`  | `Account.Status__c`          | `ACTIVE`→`Active`, `INACTIVE`→`Inactive`; anything else (including `PENDING`) is an exception |
 | `email`           | `Contact.Email`              | RFC email |
-| `created_at`      | `Account.CreatedDate`        | `YYYY-MM-DD` |
+| `created_at`      | `Account.CreatedDate`        | `YYYY-MM-DD` or `DD/MM/YYYY` |
 | `credit_card`     | *(not mapped)*               | Masked, then dropped — PAN never lands on Salesforce |
+| `notes`           | *(not mapped)*               | Free text; card-shaped substrings are masked, then dropped |
 
 If Account mapping fails, the matching Contact is not forwarded. A source row is all-or-nothing.
 
 ## What it does
 
 1. Connects to PostgreSQL with retry/backoff until the database is ready.
-2. Masks credit-card numbers (`4111-****-****-4444`) before mapping, validation, or handover.
+2. Masks credit-card numbers (`4111-****-****-4444`) in `credit_card` and in `notes` before mapping, validation, or handover.
 3. Applies `mapping.yaml` to build Salesforce `Account` and `Contact` payloads.
 4. Validates those payloads against the Salesforce Pydantic models in `schemas.py`.
 5. Writes each failed row plus mapping/validation errors to `exceptions_for_consultant.json`.
 6. POSTs valid Salesforce objects to `SUPERGLUE_API_URL`. If the engine is unreachable, it prints the formatted payload (mock fallback) instead of crashing.
 
-Seed data in `init_db.sql` is intentionally dirty so you can exercise both paths:
+Seed data in `init_db.sql` is intentionally dirty so you can exercise both paths. Placeholders such as `N/A` / `null` are treated as empty. Duplicate `Name` values are **not** merged — identity is `AccountExternalId__c`.
 
-| Company        | Outcome |
-|----------------|---------|
-| Acme Corp      | Salesforce Account (`Active`) + Contact forwarded |
-| Globex Inc     | Exception — invalid `Contact.Email` |
-| Initech LLC    | Exception — `PENDING` has no Salesforce `Status__c` value |
-| Stark Ind      | Exception — unmapped status and invalid `CreatedDate` |
-| Umbrella Corp  | Salesforce Account (`Inactive`) + Contact forwarded |
+| Company | Dirt | Outcome |
+|---------|------|---------|
+| Acme Corp | Happy path | Account (`Active`) + Contact forwarded (`legacy_erp:1`) |
+| Globex Inc | Invalid email | Exception — invalid `Contact.Email` |
+| Initech LLC | `PENDING` | Exception — no Salesforce `Status__c` value |
+| Stark Ind | Unknown status + invalid date | Exception — unmapped status and invalid `CreatedDate` |
+| Umbrella Corp | `INACTIVE` | Account (`Inactive`) + Contact forwarded |
+| Soylent Corp | Leading/trailing spaces in `raw_name` | Forwarded; `Name` / `LastName` trimmed to `Soylent Corp` |
+| Hooli | `created_at = 15/03/2026` | Forwarded; `CreatedDate=2026-03-15` |
+| Massive Dynamic | `email = N/A` | Exception — `EMPTY_VALUE` on `Contact.Email` |
+| Tyrell Corp | PAN only in `notes` | Forwarded; notes never on Salesforce; card in notes is masked on the working row |
+| (Wayne) | Blank `raw_name` | Exception — `EMPTY_VALUE` on `Account.Name` and `Contact.LastName` |
+| Oscorp | Same `Name` as Acme, different email | Forwarded as a **second** Account (`legacy_erp:11`); no silent dedupe |
+
+Expected split: **6 forwarded**, **5 exceptions**.
 
 ## Prerequisites
 
@@ -106,8 +115,8 @@ Expected log shape:
 
 ```
 📥 Ingesting legacy data from Postgres and mapping to salesforce_crm...
-📋 Isolated 3 exception(s) into 'exceptions_for_consultant.json'
-🚀 Forwarding 2 Salesforce Account(s) and 2 Contact(s) to Superglue Engine (...)
+📋 Isolated 5 exception(s) into 'exceptions_for_consultant.json'
+🚀 Forwarding 6 Salesforce Account(s) and 6 Contact(s) to Superglue Engine (...)
 ⚠️ Could not reach Superglue API Endpoint (...).
 💡 Mock Mode Active: Data successfully mapped to Salesforce and payload formatted:
 {
@@ -187,5 +196,5 @@ Fix the source row (or extend `mapping.yaml` if the customer agrees `PENDING` sh
 ## Security notes
 
 - Designed to stay inside the customer network boundary; only sanitized Salesforce JSON leaves the VPC.
-- Credit-card values are masked before mapping and are not present on Account or Contact.
+- Credit-card values are masked in `credit_card` and in `notes` before mapping and are not present on Account or Contact.
 - Compose defaults (`secretpassword`, mock API key) are for local demonstration only.

@@ -37,6 +37,16 @@ def mask_credit_card(card_str: str) -> str:
     return "****-****-****-****"
 
 
+_CARD_IN_TEXT = re.compile(r"(?:\d[ -]?){12,19}\d")
+
+
+def mask_pan_in_text(text: str | None) -> str | None:
+    """Redact card-shaped substrings in free text (e.g. notes) before mapping."""
+    if not text:
+        return text
+    return _CARD_IN_TEXT.sub(lambda match: mask_credit_card(match.group(0)), text)
+
+
 def _json_safe_errors(errors: list[dict]) -> list[dict]:
     """Pydantic ctx may contain Exception instances that json.dump cannot encode."""
     safe = []
@@ -84,7 +94,7 @@ def fetch_legacy_data():
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
-            "SELECT id, raw_name, email, account_status, credit_card, created_at FROM legacy_customers;"
+            "SELECT id, raw_name, email, account_status, credit_card, created_at, notes FROM legacy_customers;"
         )
         rows = cur.fetchall()
     conn.close()
@@ -164,6 +174,7 @@ def main():
         # Mask PAN before mapping so it never appears on Salesforce objects or in consultant logs.
         working_row = dict(row)
         working_row["credit_card"] = mask_credit_card(row.get("credit_card"))
+        working_row["notes"] = mask_pan_in_text(row.get("notes"))
 
         mapped, errors = map_row_to_salesforce(working_row, mapping)
         if mapped is None:

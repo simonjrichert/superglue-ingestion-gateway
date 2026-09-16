@@ -29,7 +29,9 @@ objects:
         transform: parse_date
         formats:
           - "%Y-%m-%d"
-        # credit_card is intentionally unmapped: PAN must not land on Salesforce.
+          - "%d/%m/%Y"
+        # credit_card and notes are intentionally unmapped.
+        # PAN must not land on Salesforce, including cards buried in notes.
 
   - name: Contact
     unique_key: Email
