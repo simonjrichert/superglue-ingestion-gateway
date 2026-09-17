@@ -1,15 +1,15 @@
+import argparse
 import os
 import json
 import re
 import time
 import requests
-import psycopg2
-from psycopg2.extras import RealDictCursor
 from pydantic import ValidationError
 from datetime import datetime, timezone
 
 from mapper import load_mapping, map_object
 from schemas import OBJECT_MODELS
+from sources import fetch_csv_rows, load_sources
 
 # --- Configuration ---
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -20,9 +20,14 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "secretpassword")
 
 SUPERGLUE_API_URL = os.getenv("SUPERGLUE_API_URL", "http://localhost:8080/api/v1/ingest")
 SUPERGLUE_API_KEY = os.getenv("SUPERGLUE_API_KEY", "sg_live_mock_key_998877")
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
 MAPPING_FILE = os.getenv(
     "MAPPING_FILE",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "mapping.yaml"),
+    os.path.join(_APP_DIR, "mapping.yaml"),
+)
+SOURCES_FILE = os.getenv(
+    "SOURCES_FILE",
+    os.path.join(_APP_DIR, "sources.yaml"),
 )
 
 
@@ -70,6 +75,9 @@ def _pydantic_errors(object_name: str, err: ValidationError) -> list[dict]:
 
 
 def fetch_legacy_data():
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+
     conn = None
     last_error = None
     for attempt in range(5):
@@ -101,6 +109,15 @@ def fetch_legacy_data():
     return [dict(row) for row in rows]
 
 
+def fetch_source_rows(source_name: str, spec: dict) -> list[dict]:
+    source_type = spec["type"]
+    if source_type == "postgres":
+        return fetch_legacy_data()
+    if source_type == "csv":
+        return fetch_csv_rows(spec, _APP_DIR)
+    raise ValueError(f"Unknown source type '{source_type}' for '{source_name}'.")
+
+
 def map_row_to_salesforce(row: dict, mapping: dict) -> tuple[dict | None, list[dict]]:
     """Transform one legacy row into Salesforce Account + Contact, or collect errors."""
     errors = []
@@ -123,13 +140,17 @@ def map_row_to_salesforce(row: dict, mapping: dict) -> tuple[dict | None, list[d
     return mapped, []
 
 
-def send_to_superglue(accounts: list[dict], contacts: list[dict]):
+def send_to_superglue(
+    accounts: list[dict],
+    contacts: list[dict],
+    source_system: str,
+):
     if not accounts:
         print("⚠️ No valid Salesforce records to send to Superglue.")
         return
 
     payload = {
-        "source_system": "legacy_erp_postgres",
+        "source_system": source_system,
         "target_system": "salesforce_crm",
         "batch_id": f"batch_{int(time.time())}",
         "record_count": len(accounts),
@@ -157,21 +178,42 @@ def send_to_superglue(accounts: list[dict], contacts: list[dict]):
         print(json.dumps(payload, indent=2, default=str))
 
 
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Map a legacy extract into Salesforce Account + Contact payloads."
+    )
+    parser.add_argument(
+        "--source",
+        default=os.getenv("SOURCE"),
+        help="Extractor name from sources.yaml (default: postgres).",
+    )
+    return parser.parse_args(argv)
+
+
 # --- Main Pipeline ---
-def main():
+def main(source_name: str | None = None):
     mapping = load_mapping(MAPPING_FILE)
+    sources_config = load_sources(SOURCES_FILE)
+    selected = source_name or sources_config.get("default", "postgres")
+    available = sources_config["sources"]
+    if selected not in available:
+        names = ", ".join(sorted(available))
+        raise ValueError(f"Unknown source '{selected}'. Defined sources: {names}.")
+
+    spec = available[selected]
+    source_system = spec.get("source_system", selected)
     print(
-        f"📥 Ingesting legacy data from Postgres and mapping to "
+        f"📥 Ingesting from '{selected}' ({spec['type']}) and mapping to "
         f"{mapping.get('target_system', 'salesforce_crm')}..."
     )
-    raw_rows = fetch_legacy_data()
+    raw_rows = fetch_source_rows(selected, spec)
 
     accounts = []
     contacts = []
     exceptions = []
 
     for row in raw_rows:
-        # Mask PAN before mapping so it never appears on Salesforce objects or in consultant logs.
+        # Mask PAN after aliasing so CSV Card Number / Comments use the same keys.
         working_row = dict(row)
         working_row["credit_card"] = mask_credit_card(row.get("credit_card"))
         working_row["notes"] = mask_pan_in_text(row.get("notes"))
@@ -180,6 +222,7 @@ def main():
         if mapped is None:
             exceptions.append(
                 {
+                    "source": selected,
                     "raw_record": working_row,
                     "errors": errors,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -195,8 +238,8 @@ def main():
         json.dump(exceptions, f, indent=2, default=str)
     print(f"📋 Isolated {len(exceptions)} exception(s) into 'exceptions_for_consultant.json'")
 
-    send_to_superglue(accounts, contacts)
+    send_to_superglue(accounts, contacts, source_system)
 
 
 if __name__ == "__main__":
-    main()
+    main(parse_args().source)

@@ -1,0 +1,23 @@
+# Extractors only. Salesforce field rules stay in mapping.yaml.
+# CSV headers are aliased onto the canonical names that mapping.yaml already uses.
+
+default: postgres
+
+sources:
+  postgres:
+    type: postgres
+    source_system: legacy_erp_postgres
+
+  csv:
+    type: csv
+    source_system: customer_csv_export
+    file: fixtures/customers_export.csv
+    encoding: utf-8-sig
+    columns:
+      id: Customer ID
+      raw_name: Company Name
+      email: E-Mail
+      account_status: Status
+      credit_card: Card Number
+      created_at: Created
+      notes: Comments

@@ -10,11 +10,12 @@ Unstructured or corrupted legacy data degrades downstream LLM agent performance 
 
 ```
 Customer VPC
-  PostgreSQL (legacy_erp)
-           │
-           ▼
+  PostgreSQL (legacy_erp)     CSV export (client column names)
+           │                         │
+           └──────────┬──────────────┘
+                      ▼
   Pre-Processing Container (Python 3.11 / Pydantic v2)
-    mask PAN → mapping.yaml → Salesforce Account + Contact
+    alias headers → mask PAN → mapping.yaml → Salesforce Account + Contact
            │
      ┌─────┴──────────────────────────┐
      ▼                                ▼
@@ -23,7 +24,7 @@ Customer VPC
   Superglue Core Execution Engine  (target_system: salesforce_crm)
 ```
 
-This repository is a Salesforce example. The same pattern applies to other ERPs (NetSuite, SAP, and so on): swap the target models and `mapping.yaml`, not the pipeline.
+This repository is a Salesforce example. The same pattern applies to other ERPs (NetSuite, SAP, and so on): swap the target models and `mapping.yaml`, not the pipeline. Postgres is the default extract; CSV is an alternate extract of a different dump with different headers. Both alias onto the same canonical fields. They are **not** merged in one run.
 
 ## Why I built it this way
 
@@ -32,6 +33,8 @@ I treated this as an on-prem customer POC, not a hosted demo. The Compose stack 
 I also refused to "fix" the SQL in place. Cleaning `account_status` or `created_at` and posting a slightly nicer `legacy_customers` row is not an implementation. Salesforce does not store `raw_name` or `PENDING`. I mapped each source row into `Account` and `Contact` (`schemas.py`) so the payload is something the target org could actually load. `target_system: salesforce_crm` in the handover body is therefore honest: the objects, field names, and picklists are Salesforce's, not the ERP's.
 
 The field decisions live in `mapping.yaml` on purpose. That file is the written result of sitting with the customer: `id` becomes `AccountExternalId__c` (`legacy_erp:{id}`) so reruns do not duplicate Accounts; `ACTIVE`/`INACTIVE` become `Active`/`Inactive`; `PENDING` has no picklist value so it is parked, not coerced; `credit_card` is not a Salesforce field at all. I did not bury those rules in `if` statements in `app.py`. If the customer later agrees `PENDING` should map, the change is the YAML (and the expected-outcome table below), not a hidden code path.
+
+Clients often do not give you the Postgres table. `sources.yaml` is the extract side of that workshop: Postgres already uses the canonical names; the CSV export uses `Company Name`, `E-Mail`, `Status`. Those headers are aliased onto the same `raw_name` / `email` / `account_status` fields `mapping.yaml` already knows. The Salesforce contract does not move when the dump format does.
 
 Failures are scoped to the row, not the batch. Unmapped statuses, bad emails, and unparseable dates go to `exceptions_for_consultant.json` with the Salesforce object, field, source column, and a stable error code (`UNMAPPED_VALUE`, `INVALID_DATE`, …). Valid Accounts/Contacts still forward. I would rather an implementation consultant fix three source rows than push illegal picklist values into Salesforce or abort the whole load because Globex has a broken email.
 
@@ -56,12 +59,13 @@ If Account mapping fails, the matching Contact is not forwarded. A source row is
 
 ## What it does
 
-1. Connects to PostgreSQL with retry/backoff until the database is ready.
-2. Masks credit-card numbers (`4111-****-****-4444`) in `credit_card` and in `notes` before mapping, validation, or handover.
-3. Applies `mapping.yaml` to build Salesforce `Account` and `Contact` payloads.
-4. Validates those payloads against the Salesforce Pydantic models in `schemas.py`.
-5. Writes each failed row plus mapping/validation errors to `exceptions_for_consultant.json`.
-6. POSTs valid Salesforce objects to `SUPERGLUE_API_URL`. If the engine is unreachable, it prints the formatted payload (mock fallback) instead of crashing.
+1. Chooses an extractor from `sources.yaml` (`postgres` by default, or `csv`).
+2. Connects to PostgreSQL with retry/backoff, **or** reads `fixtures/customers_export.csv` and aliases client headers onto canonical field names.
+3. Masks credit-card numbers (`4111-****-****-4444`) in `credit_card` and in `notes` before mapping, validation, or handover.
+4. Applies `mapping.yaml` to build Salesforce `Account` and `Contact` payloads.
+5. Validates those payloads against the Salesforce Pydantic models in `schemas.py`.
+6. Writes each failed row plus mapping/validation errors to `exceptions_for_consultant.json`.
+7. POSTs valid Salesforce objects to `SUPERGLUE_API_URL`. If the engine is unreachable, it prints the formatted payload (mock fallback) instead of crashing.
 
 Seed data in `init_db.sql` is intentionally dirty so you can exercise both paths. Placeholders such as `N/A` / `null` are treated as empty. Duplicate `Name` values are **not** merged — identity is `AccountExternalId__c`.
 
@@ -80,6 +84,37 @@ Seed data in `init_db.sql` is intentionally dirty so you can exercise both paths
 | Oscorp | Same `Name` as Acme, different email | Forwarded as a **second** Account (`legacy_erp:11`); no silent dedupe |
 
 Expected split: **6 forwarded**, **5 exceptions**.
+
+## Second source: CSV export
+
+Postgres is the default Compose path. The CSV path is a second extract: the same Salesforce mapping, different column names, different companies, different ids (`101`–`106` so `legacy_erp:101` cannot collide with `legacy_erp:1`).
+
+`fixtures/customers_export.csv` looks like a file a client emailed (`Company Name`, `E-Mail`, `Status`, extra `Region` column that is dropped). `sources.yaml` aliases those headers onto `raw_name` / `email` / `account_status` / … then `mapping.yaml` runs unchanged. PAN is masked **after** aliasing so `Card Number` and `Comments` hit the same mask as SQL `credit_card` / `notes`. Encoding is `utf-8-sig` so an Excel BOM does not become part of the first header.
+
+Do not run both sources in one batch. Pick one:
+
+```bash
+python app.py --source csv
+```
+
+Or with Compose (skip Postgres; the gateway does not need it for this path):
+
+```bash
+docker compose run --no-deps --rm -e SOURCE=csv gateway
+```
+
+`--source` overrides `SOURCE`. Both default to `postgres`.
+
+| Company | Dirt | Outcome |
+|---------|------|---------|
+| Wonka Industries | Happy path (`Customer ID=101`) | Account (`Active`) + Contact forwarded (`legacy_erp:101`) |
+| Aperture Science | `Status=inactive`, `Created=20/06/2026` | Forwarded; `Status__c=Inactive`, `CreatedDate=2026-06-20` |
+| Cyberdyne Systems | `PENDING` | Exception — no Salesforce `Status__c` value (`UNMAPPED_VALUE`) |
+| (blank name) | Empty `Company Name` | Exception — `EMPTY_VALUE` on `Account.Name` and `Contact.LastName` |
+| Vandelay Industries | Invalid email | Exception — invalid `Contact.Email` |
+| Gekko & Co | PAN only in `Comments` | Forwarded; comments never on Salesforce; card in comments is masked on the working row |
+
+Expected split: **3 forwarded**, **3 exceptions**. Handover `source_system` is `customer_csv_export`.
 
 ## Prerequisites
 
@@ -114,7 +149,7 @@ The `gateway` service waits until Postgres is healthy, then runs `app.py` once. 
 Expected log shape:
 
 ```
-📥 Ingesting legacy data from Postgres and mapping to salesforce_crm...
+📥 Ingesting from 'postgres' (postgres) and mapping to salesforce_crm...
 📋 Isolated 5 exception(s) into 'exceptions_for_consultant.json'
 🚀 Forwarding 6 Salesforce Account(s) and 6 Contact(s) to Superglue Engine (...)
 ⚠️ Could not reach Superglue API Endpoint (...).
@@ -148,7 +183,9 @@ docker compose up --build
 python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-# start Postgres separately, then:
+# CSV path — no database:
+python app.py --source csv
+# Postgres path — start Postgres separately, then:
 export DB_HOST=localhost
 python app.py
 ```
@@ -163,6 +200,8 @@ python app.py
 | `DB_USER`            | `admin`                                      | Database user                    |
 | `DB_PASSWORD`        | `secretpassword`                             | Database password                |
 | `MAPPING_FILE`       | `mapping.yaml` next to `app.py`              | Salesforce field mapping         |
+| `SOURCES_FILE`       | `sources.yaml` next to `app.py`              | Extractors and CSV column aliases |
+| `SOURCE`             | `postgres`                                   | Extractor name (`postgres` or `csv`) |
 | `SUPERGLUE_API_URL`  | `http://localhost:8080/api/v1/ingest`        | Core engine ingest endpoint      |
 | `SUPERGLUE_API_KEY`  | `sg_live_mock_key_998877`                    | Bearer token for handover        |
 
@@ -174,6 +213,7 @@ Failed records look like:
 
 ```json
 {
+  "source": "postgres",
   "raw_record": { "id": 3, "raw_name": "Initech LLC", "account_status": "PENDING", "...": "..." },
   "errors": [
     {

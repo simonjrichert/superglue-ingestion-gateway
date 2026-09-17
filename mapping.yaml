@@ -1,5 +1,6 @@
-# Maps legacy_customers → Salesforce CRM objects.
+# Maps canonical legacy fields → Salesforce CRM objects.
 # Change this file with the customer; do not hard-code field names in the pipeline.
+# Extractors (Postgres vs CSV) alias their own column names onto these sources.
 
 source: legacy_customers
 target_system: salesforce_crm
