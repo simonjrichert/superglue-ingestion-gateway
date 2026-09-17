@@ -29,6 +29,8 @@ SOURCES_FILE = os.getenv(
     "SOURCES_FILE",
     os.path.join(_APP_DIR, "sources.yaml"),
 )
+EXCEPTIONS_FILE = "exceptions_for_consultant.json"
+DRY_RUN_PAYLOAD_FILE = "dry_run_payload.json"
 
 
 # --- Helpers ---
@@ -140,16 +142,12 @@ def map_row_to_salesforce(row: dict, mapping: dict) -> tuple[dict | None, list[d
     return mapped, []
 
 
-def send_to_superglue(
+def build_handover_payload(
     accounts: list[dict],
     contacts: list[dict],
     source_system: str,
-):
-    if not accounts:
-        print("⚠️ No valid Salesforce records to send to Superglue.")
-        return
-
-    payload = {
+) -> dict:
+    return {
         "source_system": source_system,
         "target_system": "salesforce_crm",
         "batch_id": f"batch_{int(time.time())}",
@@ -159,6 +157,18 @@ def send_to_superglue(
             "Contact": contacts,
         },
     }
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def send_to_superglue(payload: dict):
+    accounts = payload["data"]["Account"]
+    contacts = payload["data"]["Contact"]
+    if not accounts:
+        print("⚠️ No valid Salesforce records to send to Superglue.")
+        return
 
     headers = {
         "Content-Type": "application/json",
@@ -178,6 +188,19 @@ def send_to_superglue(
         print(json.dumps(payload, indent=2, default=str))
 
 
+def write_dry_run_payload(payload: dict, ingested: int, forwarded: int, isolated: int):
+    with open(DRY_RUN_PAYLOAD_FILE, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, default=str)
+    print(
+        f"🧪 Dry-run: ingested {ingested}, would forward {forwarded} Account(s) and "
+        f"{forwarded} Contact(s), isolated {isolated} exception(s). No POST."
+    )
+    print(
+        f"   Inspect '{DRY_RUN_PAYLOAD_FILE}' and '{EXCEPTIONS_FILE}' "
+        "before running without --dry-run."
+    )
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Map a legacy extract into Salesforce Account + Contact payloads."
@@ -187,11 +210,16 @@ def parse_args(argv=None):
         default=os.getenv("SOURCE"),
         help="Extractor name from sources.yaml (default: postgres).",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Map and write exceptions, but do not POST to the engine.",
+    )
     return parser.parse_args(argv)
 
 
 # --- Main Pipeline ---
-def main(source_name: str | None = None):
+def main(source_name: str | None = None, dry_run: bool = False):
     mapping = load_mapping(MAPPING_FILE)
     sources_config = load_sources(SOURCES_FILE)
     selected = source_name or sources_config.get("default", "postgres")
@@ -206,6 +234,8 @@ def main(source_name: str | None = None):
         f"📥 Ingesting from '{selected}' ({spec['type']}) and mapping to "
         f"{mapping.get('target_system', 'salesforce_crm')}..."
     )
+    if dry_run:
+        print("🧪 Dry-run enabled: map and isolate exceptions, do not POST.")
     raw_rows = fetch_source_rows(selected, spec)
 
     accounts = []
@@ -234,12 +264,21 @@ def main(source_name: str | None = None):
         accounts.append(mapped["Account"])
         contacts.append(mapped["Contact"])
 
-    with open("exceptions_for_consultant.json", "w", encoding="utf-8") as f:
+    with open(EXCEPTIONS_FILE, "w", encoding="utf-8") as f:
         json.dump(exceptions, f, indent=2, default=str)
-    print(f"📋 Isolated {len(exceptions)} exception(s) into 'exceptions_for_consultant.json'")
+    print(f"📋 Isolated {len(exceptions)} exception(s) into '{EXCEPTIONS_FILE}'")
 
-    send_to_superglue(accounts, contacts, source_system)
+    payload = build_handover_payload(accounts, contacts, source_system)
+    if dry_run:
+        write_dry_run_payload(payload, len(raw_rows), len(accounts), len(exceptions))
+        return
+
+    send_to_superglue(payload)
 
 
 if __name__ == "__main__":
-    main(parse_args().source)
+    args = parse_args()
+    main(
+        source_name=args.source,
+        dry_run=args.dry_run or _env_flag("DRY_RUN"),
+    )

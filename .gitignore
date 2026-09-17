@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 .pytest_cache/
 exceptions_for_consultant.json
+dry_run_payload.json

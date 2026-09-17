@@ -19,7 +19,8 @@ Customer VPC
            │
      ┌─────┴──────────────────────────┐
      ▼                                ▼
-  HTTP POST Salesforce objects   exceptions_for_consultant.json
+  HTTP POST  or  --dry-run          exceptions_for_consultant.json
+  (skipped in dry-run)              dry_run_payload.json
      ▼
   Superglue Core Execution Engine  (target_system: salesforce_crm)
 ```
@@ -39,6 +40,8 @@ Clients often do not give you the Postgres table. `sources.yaml` is the extract 
 Failures are scoped to the row, not the batch. Unmapped statuses, bad emails, and unparseable dates go to `exceptions_for_consultant.json` with the Salesforce object, field, source column, and a stable error code (`UNMAPPED_VALUE`, `INVALID_DATE`, …). Valid Accounts/Contacts still forward. I would rather an implementation consultant fix three source rows than push illegal picklist values into Salesforce or abort the whole load because Globex has a broken email.
 
 Safety here is about egress, not a scanner bolted on at the end. I mask PAN on a working copy of the row before mapping, drop `credit_card` from the target schema, and keep the exception log on that same masked copy. The only JSON meant to leave the network is Salesforce-shaped records that never contained a full card number.
+
+`--dry-run` is the rehearsal before that egress. Same extract, mask, mapping, and exception file; no HTTP. You inspect `dry_run_payload.json` with the consultant, then run again without the flag. That is different from mock mode: mock mode is "I intended to POST and port 8080 was down." Dry-run is "I did not intend to POST yet."
 
 ## Salesforce mapping
 
@@ -65,7 +68,8 @@ If Account mapping fails, the matching Contact is not forwarded. A source row is
 4. Applies `mapping.yaml` to build Salesforce `Account` and `Contact` payloads.
 5. Validates those payloads against the Salesforce Pydantic models in `schemas.py`.
 6. Writes each failed row plus mapping/validation errors to `exceptions_for_consultant.json`.
-7. POSTs valid Salesforce objects to `SUPERGLUE_API_URL`. If the engine is unreachable, it prints the formatted payload (mock fallback) instead of crashing.
+7. If `--dry-run` / `DRY_RUN=1`: writes the would-be handover to `dry_run_payload.json` and **does not POST**.
+8. Otherwise POSTs valid Salesforce objects to `SUPERGLUE_API_URL`. If the engine is unreachable, it prints the formatted payload (mock fallback) instead of crashing.
 
 Seed data in `init_db.sql` is intentionally dirty so you can exercise both paths. Placeholders such as `N/A` / `null` are treated as empty. Duplicate `Name` values are **not** merged — identity is `AccountExternalId__c`.
 
@@ -116,6 +120,34 @@ docker compose run --no-deps --rm -e SOURCE=csv gateway
 
 Expected split: **3 forwarded**, **3 exceptions**. Handover `source_system` is `customer_csv_export`.
 
+## Dry-run
+
+`--dry-run` is a rehearsal of the load, not a copy of customer infra. Mapping and exceptions still run; nothing is posted to the engine.
+
+Use it to answer "how many would forward, which rows park, what would Acme/Wonka look like as Salesforce objects?" before a real handover. Inspect:
+
+- `exceptions_for_consultant.json` — parked rows and error codes
+- `dry_run_payload.json` — the exact JSON that a non-dry run would POST
+
+```bash
+python app.py --dry-run
+python app.py --source csv --dry-run
+```
+
+Compose (CSV does not need Postgres):
+
+```bash
+docker compose run --no-deps --rm -e SOURCE=csv -e DRY_RUN=1 gateway
+```
+
+Postgres dry-run still needs a healthy `db` (or a local Python run with Postgres up):
+
+```bash
+docker compose run --rm -e DRY_RUN=1 gateway
+```
+
+`--dry-run` overrides nothing about the mapping. `DRY_RUN=1` (or `true` / `yes` / `on`) is the same flag for Compose. A run without either still POSTs (or falls back to mock print if port 8080 is down).
+
 ## Prerequisites
 
 - Docker Engine 24+
@@ -144,7 +176,7 @@ If containers start but the gateway times out talking to `db`, bridge traffic is
 sudo sysctl -w net.bridge.bridge-nf-call-iptables=0
 ```
 
-The `gateway` service waits until Postgres is healthy, then runs `app.py` once. Exceptions land on the host at `./exceptions_for_consultant.json` because the container mounts the project directory.
+The `gateway` service waits until Postgres is healthy, then runs `app.py` once. Exceptions land on the host at `./exceptions_for_consultant.json` because the container mounts the project directory. A dry-run also writes `./dry_run_payload.json` there.
 
 Expected log shape:
 
@@ -185,9 +217,11 @@ source .venv/bin/activate
 pip install -r requirements.txt
 # CSV path — no database:
 python app.py --source csv
+python app.py --source csv --dry-run
 # Postgres path — start Postgres separately, then:
 export DB_HOST=localhost
 python app.py
+python app.py --dry-run
 ```
 
 ## Configuration
@@ -202,6 +236,7 @@ python app.py
 | `MAPPING_FILE`       | `mapping.yaml` next to `app.py`              | Salesforce field mapping         |
 | `SOURCES_FILE`       | `sources.yaml` next to `app.py`              | Extractors and CSV column aliases |
 | `SOURCE`             | `postgres`                                   | Extractor name (`postgres` or `csv`) |
+| `DRY_RUN`            | unset / `0`                                  | `1` maps and writes files, skips POST |
 | `SUPERGLUE_API_URL`  | `http://localhost:8080/api/v1/ingest`        | Core engine ingest endpoint      |
 | `SUPERGLUE_API_KEY`  | `sg_live_mock_key_998877`                    | Bearer token for handover        |
 
