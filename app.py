@@ -3,13 +3,19 @@ import os
 import json
 import re
 import time
-import requests
 from pydantic import ValidationError
 from datetime import datetime, timezone
 
 from mapper import load_mapping, map_object
 from schemas import OBJECT_MODELS
 from sources import fetch_csv_rows, load_sources
+from handover import (
+    FORWARDED_FILE,
+    deliver_payload,
+    flush_outbox,
+    outbox_files,
+    skip_ids,
+)
 
 # --- Configuration ---
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -165,27 +171,10 @@ def _env_flag(name: str) -> bool:
 
 def send_to_superglue(payload: dict):
     accounts = payload["data"]["Account"]
-    contacts = payload["data"]["Contact"]
     if not accounts:
         print("⚠️ No valid Salesforce records to send to Superglue.")
         return
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {SUPERGLUE_API_KEY}",
-    }
-
-    print(
-        f"🚀 Forwarding {len(accounts)} Salesforce Account(s) and "
-        f"{len(contacts)} Contact(s) to Superglue Engine ({SUPERGLUE_API_URL})..."
-    )
-    try:
-        res = requests.post(SUPERGLUE_API_URL, json=payload, headers=headers, timeout=5)
-        print(f"✅ Response [HTTP {res.status_code}]: {res.text}")
-    except requests.exceptions.RequestException as e:
-        print(f"⚠️ Could not reach Superglue API Endpoint ({e}).")
-        print("💡 Mock Mode Active: Data successfully mapped to Salesforce and payload formatted:")
-        print(json.dumps(payload, indent=2, default=str))
+    deliver_payload(payload, SUPERGLUE_API_URL, SUPERGLUE_API_KEY)
 
 
 def write_dry_run_payload(payload: dict, ingested: int, forwarded: int, isolated: int):
@@ -215,11 +204,25 @@ def parse_args(argv=None):
         action="store_true",
         help="Map and write exceptions, but do not POST to the engine.",
     )
+    parser.add_argument(
+        "--flush-outbox",
+        action="store_true",
+        help="POST pending outbox files only; do not extract or map again.",
+    )
     return parser.parse_args(argv)
 
 
 # --- Main Pipeline ---
-def main(source_name: str | None = None, dry_run: bool = False):
+def main(
+    source_name: str | None = None,
+    dry_run: bool = False,
+    flush_only: bool = False,
+):
+    if flush_only:
+        print("📤 Flushing outbox (no extract/map).")
+        flush_outbox(SUPERGLUE_API_URL, SUPERGLUE_API_KEY)
+        return
+
     mapping = load_mapping(MAPPING_FILE)
     sources_config = load_sources(SOURCES_FILE)
     selected = source_name or sources_config.get("default", "postgres")
@@ -236,11 +239,16 @@ def main(source_name: str | None = None, dry_run: bool = False):
     )
     if dry_run:
         print("🧪 Dry-run enabled: map and isolate exceptions, do not POST.")
+    elif outbox_files():
+        flush_outbox(SUPERGLUE_API_URL, SUPERGLUE_API_KEY)
+
+    already = skip_ids()
     raw_rows = fetch_source_rows(selected, spec)
 
     accounts = []
     contacts = []
     exceptions = []
+    skipped = 0
 
     for row in raw_rows:
         # Mask PAN after aliasing so CSV Card Number / Comments use the same keys.
@@ -261,12 +269,22 @@ def main(source_name: str | None = None, dry_run: bool = False):
             )
             continue
 
+        external_id = mapped["Account"]["AccountExternalId__c"]
+        if external_id in already:
+            skipped += 1
+            continue
+
         accounts.append(mapped["Account"])
         contacts.append(mapped["Contact"])
 
     with open(EXCEPTIONS_FILE, "w", encoding="utf-8") as f:
         json.dump(exceptions, f, indent=2, default=str)
     print(f"📋 Isolated {len(exceptions)} exception(s) into '{EXCEPTIONS_FILE}'")
+    if skipped:
+        print(
+            f"⏭️ Replay: skipped {skipped} mapped row(s) already in "
+            f"'{FORWARDED_FILE}' or outbox."
+        )
 
     payload = build_handover_payload(accounts, contacts, source_system)
     if dry_run:
@@ -281,4 +299,5 @@ if __name__ == "__main__":
     main(
         source_name=args.source,
         dry_run=args.dry_run or _env_flag("DRY_RUN"),
+        flush_only=args.flush_outbox or _env_flag("FLUSH_OUTBOX"),
     )

@@ -5,3 +5,5 @@ __pycache__/
 .pytest_cache/
 exceptions_for_consultant.json
 dry_run_payload.json
+outbox/*.json
+state/forwarded.json

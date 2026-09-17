@@ -20,7 +20,8 @@ Customer VPC
      ┌─────┴──────────────────────────┐
      ▼                                ▼
   HTTP POST  or  --dry-run          exceptions_for_consultant.json
-  (skipped in dry-run)              dry_run_payload.json
+  (2xx → state/forwarded.json)      dry_run_payload.json
+  (fail → outbox/*.json)
      ▼
   Superglue Core Execution Engine  (target_system: salesforce_crm)
 ```
@@ -41,7 +42,7 @@ Failures are scoped to the row, not the batch. Unmapped statuses, bad emails, an
 
 Safety here is about egress, not a scanner bolted on at the end. I mask PAN on a working copy of the row before mapping, drop `credit_card` from the target schema, and keep the exception log on that same masked copy. The only JSON meant to leave the network is Salesforce-shaped records that never contained a full card number.
 
-`--dry-run` is the rehearsal before that egress. Same extract, mask, mapping, and exception file; no HTTP. You inspect `dry_run_payload.json` with the consultant, then run again without the flag. That is different from mock mode: mock mode is "I intended to POST and port 8080 was down." Dry-run is "I did not intend to POST yet."
+`--dry-run` is the rehearsal before that egress. Same extract, mask, mapping, and exception file; no HTTP. You inspect `dry_run_payload.json` with the consultant, then run again without the flag. That is different from the **outbox**: dry-run is "I did not intend to POST yet." Outbox is "I intended to POST and the engine failed; the payload is on disk." Successful POSTs record `AccountExternalId__c` in `state/forwarded.json` so a later run does not send Acme (`legacy_erp:1`) again.
 
 ## Salesforce mapping
 
@@ -68,8 +69,9 @@ If Account mapping fails, the matching Contact is not forwarded. A source row is
 4. Applies `mapping.yaml` to build Salesforce `Account` and `Contact` payloads.
 5. Validates those payloads against the Salesforce Pydantic models in `schemas.py`.
 6. Writes each failed row plus mapping/validation errors to `exceptions_for_consultant.json`.
-7. If `--dry-run` / `DRY_RUN=1`: writes the would-be handover to `dry_run_payload.json` and **does not POST**.
-8. Otherwise POSTs valid Salesforce objects to `SUPERGLUE_API_URL`. If the engine is unreachable, it prints the formatted payload (mock fallback) instead of crashing.
+7. If `--dry-run` / `DRY_RUN=1`: writes the would-be handover to `dry_run_payload.json` and **does not POST** (and does not write the outbox).
+8. Otherwise POSTs valid Salesforce objects to `SUPERGLUE_API_URL`. HTTP 2xx records those `AccountExternalId__c` values in `state/forwarded.json`. If the engine is unreachable or returns a non-2xx, the payload is written to `outbox/<batch_id>.json` and those ids are **not** marked forwarded.
+9. A later run skips ids already forwarded or already sitting in the outbox (replay). `--flush-outbox` POSTs pending files without extracting again.
 
 Seed data in `init_db.sql` is intentionally dirty so you can exercise both paths. Placeholders such as `N/A` / `null` are treated as empty. Duplicate `Name` values are **not** merged — identity is `AccountExternalId__c`.
 
@@ -146,7 +148,24 @@ Postgres dry-run still needs a healthy `db` (or a local Python run with Postgres
 docker compose run --rm -e DRY_RUN=1 gateway
 ```
 
-`--dry-run` overrides nothing about the mapping. `DRY_RUN=1` (or `true` / `yes` / `on`) is the same flag for Compose. A run without either still POSTs (or falls back to mock print if port 8080 is down).
+`--dry-run` overrides nothing about the mapping. `DRY_RUN=1` (or `true` / `yes` / `on`) is the same flag for Compose. A run without either still POSTs. Failed POSTs go to the outbox instead of a throwaway mock print.
+
+## Outbox and replay
+
+Identity is `AccountExternalId__c` (`legacy_erp:{id}`). Mapping already stamps that key; outbox/replay is the **workflow** around it.
+
+**Outbox** (`outbox/<batch_id>.json`): if a real run cannot deliver (connection error or non-2xx), the Salesforce payload is saved on disk. Those ids are not written to `state/forwarded.json`. Re-run the gateway (it tries to flush existing outbox files first) or:
+
+```bash
+python app.py --flush-outbox
+docker compose run --no-deps --rm -e FLUSH_OUTBOX=1 gateway
+```
+
+Dry-run never writes the outbox.
+
+**Replay** (`state/forwarded.json`): after HTTP 2xx, external ids are recorded. The next extract still maps every row (exceptions stay visible) but **skips** Accounts already forwarded or already pending in outbox. Acme (`legacy_erp:1`) is not POSTed twice. If a consultant later fixes Globex, that new id was never forwarded, so it goes out on the next live run.
+
+To rehearse from scratch, delete `state/forwarded.json` and `outbox/*.json` (both are gitignored). Compose mounts the project directory, so those files land on the host.
 
 ## Prerequisites
 
@@ -176,24 +195,23 @@ If containers start but the gateway times out talking to `db`, bridge traffic is
 sudo sysctl -w net.bridge.bridge-nf-call-iptables=0
 ```
 
-The `gateway` service waits until Postgres is healthy, then runs `app.py` once. Exceptions land on the host at `./exceptions_for_consultant.json` because the container mounts the project directory. A dry-run also writes `./dry_run_payload.json` there.
+The `gateway` service waits until Postgres is healthy, then runs `app.py` once. Exceptions land on the host at `./exceptions_for_consultant.json` because the container mounts the project directory. A dry-run also writes `./dry_run_payload.json` there. A failed live POST writes `./outbox/*.json`; a successful POST updates `./state/forwarded.json`.
 
-Expected log shape:
+Expected log shape (first live run, engine down):
 
 ```
 📥 Ingesting from 'postgres' (postgres) and mapping to salesforce_crm...
 📋 Isolated 5 exception(s) into 'exceptions_for_consultant.json'
 🚀 Forwarding 6 Salesforce Account(s) and 6 Contact(s) to Superglue Engine (...)
 ⚠️ Could not reach Superglue API Endpoint (...).
-💡 Mock Mode Active: Data successfully mapped to Salesforce and payload formatted:
-{
-  "source_system": "legacy_erp_postgres",
-  "target_system": "salesforce_crm",
-  "data": {
-    "Account": [ { "Name": "Acme Corp", "Status__c": "Active", "...": "..." } ],
-    "Contact": [ { "LastName": "Acme Corp", "Email": "contact@acme.com", "...": "..." } ]
-  }
-}
+📦 Payload saved to 'outbox/batch_....json'. It is not marked forwarded.
+```
+
+Second live run, still down:
+
+```
+⏭️ Replay: skipped 6 mapped row(s) already in 'state/forwarded.json' or outbox.
+⚠️ No valid Salesforce records to send to Superglue.
 ```
 
 Tear down:
@@ -222,6 +240,7 @@ python app.py --source csv --dry-run
 export DB_HOST=localhost
 python app.py
 python app.py --dry-run
+python app.py --flush-outbox
 ```
 
 ## Configuration
@@ -237,6 +256,9 @@ python app.py --dry-run
 | `SOURCES_FILE`       | `sources.yaml` next to `app.py`              | Extractors and CSV column aliases |
 | `SOURCE`             | `postgres`                                   | Extractor name (`postgres` or `csv`) |
 | `DRY_RUN`            | unset / `0`                                  | `1` maps and writes files, skips POST |
+| `FLUSH_OUTBOX`       | unset / `0`                                  | `1` POSTs `outbox/*.json` only       |
+| `OUTBOX_DIR`         | `outbox`                                     | Failed-handover JSON                 |
+| `FORWARDED_FILE`     | `state/forwarded.json`                       | Replay ledger of sent external ids   |
 | `SUPERGLUE_API_URL`  | `http://localhost:8080/api/v1/ingest`        | Core engine ingest endpoint      |
 | `SUPERGLUE_API_KEY`  | `sg_live_mock_key_998877`                    | Bearer token for handover        |
 
