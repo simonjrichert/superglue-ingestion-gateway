@@ -26,7 +26,8 @@ services:
       DB_NAME: legacy_erp
       DB_USER: admin
       DB_PASSWORD: secretpassword
-      SUPERGLUE_API_URL: http://localhost:8080/api/v1/ingest
+      SUPERGLUE_API_URL: https://api.superglue.ai/v1
+      SUPERGLUE_TOOL_ID: upsert-salesforce-customers
       SUPERGLUE_API_KEY: sg_live_mock_key_998877
     depends_on:
       db:

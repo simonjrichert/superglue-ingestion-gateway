@@ -24,7 +24,8 @@ DB_NAME = os.getenv("DB_NAME", "legacy_erp")
 DB_USER = os.getenv("DB_USER", "admin")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "secretpassword")
 
-SUPERGLUE_API_URL = os.getenv("SUPERGLUE_API_URL", "http://localhost:8080/api/v1/ingest")
+SUPERGLUE_API_URL = os.getenv("SUPERGLUE_API_URL", "https://api.superglue.ai/v1")
+SUPERGLUE_TOOL_ID = os.getenv("SUPERGLUE_TOOL_ID", "upsert-salesforce-customers")
 SUPERGLUE_API_KEY = os.getenv("SUPERGLUE_API_KEY", "sg_live_mock_key_998877")
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 MAPPING_FILE = os.getenv(
@@ -148,20 +149,21 @@ def map_row_to_salesforce(row: dict, mapping: dict) -> tuple[dict | None, list[d
     return mapped, []
 
 
-def build_handover_payload(
-    accounts: list[dict],
-    contacts: list[dict],
-    source_system: str,
-) -> dict:
+def tool_run_url() -> str:
+    """POST /v1/tools/{toolId}/run. A URL that already ends in /run is used as-is."""
+    base = SUPERGLUE_API_URL.rstrip("/")
+    if base.endswith("/run"):
+        return base
+    return f"{base}/tools/{SUPERGLUE_TOOL_ID}/run"
+
+
+def build_handover_payload(accounts: list[dict], contacts: list[dict]) -> dict:
     return {
-        "source_system": source_system,
-        "target_system": "salesforce_crm",
-        "batch_id": f"batch_{int(time.time())}",
-        "record_count": len(accounts),
-        "data": {
+        "inputs": {
             "Account": accounts,
             "Contact": contacts,
         },
+        "options": {"async": True},
     }
 
 
@@ -170,11 +172,11 @@ def _env_flag(name: str) -> bool:
 
 
 def send_to_superglue(payload: dict):
-    accounts = payload["data"]["Account"]
+    accounts = payload["inputs"]["Account"]
     if not accounts:
         print("⚠️ No valid Salesforce records to send to Superglue.")
         return
-    deliver_payload(payload, SUPERGLUE_API_URL, SUPERGLUE_API_KEY)
+    deliver_payload(payload, tool_run_url(), SUPERGLUE_API_KEY)
 
 
 def write_dry_run_payload(payload: dict, ingested: int, forwarded: int, isolated: int):
@@ -220,7 +222,7 @@ def main(
 ):
     if flush_only:
         print("📤 Flushing outbox (no extract/map).")
-        flush_outbox(SUPERGLUE_API_URL, SUPERGLUE_API_KEY)
+        flush_outbox(tool_run_url(), SUPERGLUE_API_KEY)
         return
 
     mapping = load_mapping(MAPPING_FILE)
@@ -232,7 +234,6 @@ def main(
         raise ValueError(f"Unknown source '{selected}'. Defined sources: {names}.")
 
     spec = available[selected]
-    source_system = spec.get("source_system", selected)
     print(
         f"📥 Ingesting from '{selected}' ({spec['type']}) and mapping to "
         f"{mapping.get('target_system', 'salesforce_crm')}..."
@@ -240,7 +241,7 @@ def main(
     if dry_run:
         print("🧪 Dry-run enabled: map and isolate exceptions, do not POST.")
     elif outbox_files():
-        flush_outbox(SUPERGLUE_API_URL, SUPERGLUE_API_KEY)
+        flush_outbox(tool_run_url(), SUPERGLUE_API_KEY)
 
     already = skip_ids()
     raw_rows = fetch_source_rows(selected, spec)
@@ -286,7 +287,7 @@ def main(
             f"'{FORWARDED_FILE}' or outbox."
         )
 
-    payload = build_handover_payload(accounts, contacts, source_system)
+    payload = build_handover_payload(accounts, contacts)
     if dry_run:
         write_dry_run_payload(payload, len(raw_rows), len(accounts), len(exceptions))
         return

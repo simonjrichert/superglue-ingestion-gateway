@@ -18,8 +18,18 @@ def _ensure_dirs():
     Path(FORWARDED_FILE).parent.mkdir(parents=True, exist_ok=True)
 
 
+def payload_inputs(payload: dict) -> dict:
+    """Tool-run body uses inputs; older outbox files used data."""
+    if "inputs" in payload:
+        return payload.get("inputs") or {}
+    return payload.get("data") or {}
+
+
 def payload_external_ids(payload: dict) -> list[str]:
-    return [account["AccountExternalId__c"] for account in payload.get("data", {}).get("Account", [])]
+    return [
+        account["AccountExternalId__c"]
+        for account in payload_inputs(payload).get("Account", [])
+    ]
 
 
 def load_forwarded_ids() -> set[str]:
@@ -73,7 +83,7 @@ def skip_ids() -> set[str]:
 
 def write_outbox(payload: dict) -> Path:
     _ensure_dirs()
-    batch_id = payload.get("batch_id") or f"batch_{int(datetime.now(timezone.utc).timestamp())}"
+    batch_id = f"batch_{int(datetime.now(timezone.utc).timestamp())}"
     path = Path(OUTBOX_DIR) / f"{batch_id}.json"
     path.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
     return path
@@ -81,8 +91,9 @@ def write_outbox(payload: dict) -> Path:
 
 def post_payload(payload: dict, url: str, api_key: str) -> tuple[bool, str]:
     """POST one handover body. Returns (success, log line)."""
-    accounts = payload.get("data", {}).get("Account", [])
-    contacts = payload.get("data", {}).get("Contact", [])
+    records = payload_inputs(payload)
+    accounts = records.get("Account", [])
+    contacts = records.get("Contact", [])
     if not accounts:
         return True, "⚠️ No valid Salesforce records to send to Superglue."
 
@@ -146,6 +157,7 @@ def flush_outbox(url: str, api_key: str) -> int:
         print(message)
         if not ok:
             print(f"📦 Left '{path}' in outbox.")
+            print(json.dumps(payload, indent=2, default=str))
             continue
         mark_forwarded(payload_external_ids(payload))
         path.unlink(missing_ok=True)

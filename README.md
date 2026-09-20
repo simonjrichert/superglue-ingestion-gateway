@@ -23,7 +23,7 @@ Customer VPC
   (2xx → state/forwarded.json)      dry_run_payload.json
   (fail → outbox/*.json)
      ▼
-  Superglue Core Execution Engine  (target_system: salesforce_crm)
+  POST /v1/tools/{toolId}/run  (inputs: Account + Contact)
 ```
 
 This repository is a Salesforce example. The same pattern applies to other ERPs (NetSuite, SAP, and so on): swap the target models and `mapping.yaml`, not the pipeline. Postgres is the default extract; CSV is an alternate extract of a different dump with different headers. Both alias onto the same canonical fields. They are **not** merged in one run.
@@ -32,7 +32,7 @@ This repository is a Salesforce example. The same pattern applies to other ERPs 
 
 I treated this as an on-prem customer POC, not a hosted demo. The Compose stack is a stand-in for a VPC: the gateway container reads the customer's Postgres (`legacy_erp.legacy_customers`) and only then opens an outbound HTTP call. Nothing in the happy path assumes a SaaS connector already has clean REST objects.
 
-I also refused to "fix" the SQL in place. Cleaning `account_status` or `created_at` and posting a slightly nicer `legacy_customers` row is not an implementation. Salesforce does not store `raw_name` or `PENDING`. I mapped each source row into `Account` and `Contact` (`schemas.py`) so the payload is something the target org could actually load. `target_system: salesforce_crm` in the handover body is therefore honest: the objects, field names, and picklists are Salesforce's, not the ERP's.
+I also refused to "fix" the SQL in place. Cleaning `account_status` or `created_at` and posting a slightly nicer `legacy_customers` row is not an implementation. Salesforce does not store `raw_name` or `PENDING`. I mapped each source row into `Account` and `Contact` (`schemas.py`) so the payload is something the target org could actually load. The handover is a tool run (`POST /v1/tools/{toolId}/run`): `inputs.Account` / `inputs.Contact` match that Salesforce contract. The saved tool upserts into the org; this gateway does not call the Salesforce API.
 
 The field decisions live in `mapping.yaml` on purpose. That file is the written result of sitting with the customer: `id` becomes `AccountExternalId__c` (`legacy_erp:{id}`) so reruns do not duplicate Accounts; `ACTIVE`/`INACTIVE` become `Active`/`Inactive`; `PENDING` has no picklist value so it is parked, not coerced; `credit_card` is not a Salesforce field at all. I did not bury those rules in `if` statements in `app.py`. If the customer later agrees `PENDING` should map, the change is the YAML (and the expected-outcome table below), not a hidden code path.
 
@@ -70,7 +70,7 @@ If Account mapping fails, the matching Contact is not forwarded. A source row is
 5. Validates those payloads against the Salesforce Pydantic models in `schemas.py`.
 6. Writes each failed row plus mapping/validation errors to `exceptions_for_consultant.json`.
 7. If `--dry-run` / `DRY_RUN=1`: writes the would-be handover to `dry_run_payload.json` and **does not POST** (and does not write the outbox).
-8. Otherwise POSTs valid Salesforce objects to `SUPERGLUE_API_URL`. HTTP 2xx records those `AccountExternalId__c` values in `state/forwarded.json`. If the engine is unreachable or returns a non-2xx, the payload is written to `outbox/<batch_id>.json` and those ids are **not** marked forwarded.
+8. Otherwise POSTs `{ inputs: { Account, Contact }, options: { async: true } }` to `SUPERGLUE_API_URL/tools/{SUPERGLUE_TOOL_ID}/run`. HTTP 2xx (including 202) records those `AccountExternalId__c` values in `state/forwarded.json`. If the engine is unreachable or returns a non-2xx, the payload is written to `outbox/<batch_id>.json` and those ids are **not** marked forwarded.
 9. A later run skips ids already forwarded or already sitting in the outbox (replay). `--flush-outbox` POSTs pending files without extracting again.
 
 Seed data in `init_db.sql` is intentionally dirty so you can exercise both paths. Placeholders such as `N/A` / `null` are treated as empty. Duplicate `Name` values are **not** merged — identity is `AccountExternalId__c`.
@@ -120,7 +120,7 @@ docker compose run --no-deps --rm -e SOURCE=csv gateway
 | Vandelay Industries | Invalid email | Exception — invalid `Contact.Email` |
 | Gekko & Co | PAN only in `Comments` | Forwarded; comments never on Salesforce; card in comments is masked on the working row |
 
-Expected split: **3 forwarded**, **3 exceptions**. Handover `source_system` is `customer_csv_export`.
+Expected split: **3 forwarded**, **3 exceptions**. Extract is `customer_csv_export`; the tool-run body is still `inputs.Account` / `inputs.Contact`.
 
 ## Dry-run
 
@@ -259,10 +259,11 @@ python app.py --flush-outbox
 | `FLUSH_OUTBOX`       | unset / `0`                                  | `1` POSTs `outbox/*.json` only       |
 | `OUTBOX_DIR`         | `outbox`                                     | Failed-handover JSON                 |
 | `FORWARDED_FILE`     | `state/forwarded.json`                       | Replay ledger of sent external ids   |
-| `SUPERGLUE_API_URL`  | `http://localhost:8080/api/v1/ingest`        | Core engine ingest endpoint      |
-| `SUPERGLUE_API_KEY`  | `sg_live_mock_key_998877`                    | Bearer token for handover        |
+| `SUPERGLUE_API_URL`  | `https://api.superglue.ai/v1`                 | API root (or a full `.../run` URL) |
+| `SUPERGLUE_TOOL_ID`  | `upsert-salesforce-customers`                | Saved Salesforce upsert tool       |
+| `SUPERGLUE_API_KEY`  | `sg_live_mock_key_998877`                    | Bearer token for handover          |
 
-Replace the mock API URL and key with your tenant's Superglue Core credentials in production. Do not commit live keys.
+Replace the mock tool id and key with your tenant's saved tool and API key. Do not commit live keys. The gateway never POSTs to Salesforce directly.
 
 ## Consultant exception log
 
