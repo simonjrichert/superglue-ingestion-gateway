@@ -70,7 +70,7 @@ If Account mapping fails, the matching Contact is not forwarded. A source row is
 5. Validates those payloads against the Salesforce Pydantic models in `schemas.py`.
 6. Writes each failed row plus mapping/validation errors to `exceptions_for_consultant.json`.
 7. If `--dry-run` / `DRY_RUN=1`: writes the would-be handover to `dry_run_payload.json` and **does not POST** (and does not write the outbox).
-8. Otherwise POSTs `{ inputs: { Account, Contact }, options: { async: true } }` to `SUPERGLUE_API_URL/tools/{SUPERGLUE_TOOL_ID}/run`. HTTP 2xx (including 202) records those `AccountExternalId__c` values in `state/forwarded.json`. If the engine is unreachable or returns a non-2xx, the payload is written to `outbox/<batch_id>.json` and those ids are **not** marked forwarded.
+8. Otherwise POSTs `{ runId, inputs: { Account, Contact }, options: { async: true } }` to `SUPERGLUE_API_URL/tools/{SUPERGLUE_TOOL_ID}/run`. `runId` is one UUID per handover so a timeout retry (outbox flush) does not start a second tool run. HTTP 2xx (including 202) records those `AccountExternalId__c` values in `state/forwarded.json`. If the engine is unreachable or returns a non-2xx, the payload is written to `outbox/<runId>.json` and those ids are **not** marked forwarded.
 9. A later run skips ids already forwarded or already sitting in the outbox (replay). `--flush-outbox` POSTs pending files without extracting again.
 
 Seed data in `init_db.sql` is intentionally dirty so you can exercise both paths. Placeholders such as `N/A` / `null` are treated as empty. Duplicate `Name` values are **not** merged — identity is `AccountExternalId__c`.
@@ -154,7 +154,7 @@ docker compose run --rm -e DRY_RUN=1 gateway
 
 Identity is `AccountExternalId__c` (`legacy_erp:{id}`). Mapping already stamps that key; outbox/replay is the **workflow** around it.
 
-**Outbox** (`outbox/<batch_id>.json`): if a real run cannot deliver (connection error or non-2xx), the Salesforce payload is saved on disk. Those ids are not written to `state/forwarded.json`. Re-run the gateway (it tries to flush existing outbox files first) or:
+**Outbox** (`outbox/<runId>.json`): if a real run cannot deliver (connection error or non-2xx), the Salesforce payload is saved on disk, including the same `runId`. Those ids are not written to `state/forwarded.json`. A later extract **skips** those ids and does not mint a new `runId`. Retry the same POST with:
 
 ```bash
 python app.py --flush-outbox
@@ -202,14 +202,16 @@ Expected log shape (first live run, engine down):
 ```
 📥 Ingesting from 'postgres' (postgres) and mapping to salesforce_crm...
 📋 Isolated 5 exception(s) into 'exceptions_for_consultant.json'
-🚀 Forwarding 6 Salesforce Account(s) and 6 Contact(s) to Superglue Engine (...)
+🚀 Forwarding 6 Salesforce Account(s) and 6 Contact(s) to Superglue Engine (...) runId=...
 ⚠️ Could not reach Superglue API Endpoint (...).
-📦 Payload saved to 'outbox/batch_....json'. It is not marked forwarded.
+📦 Payload saved to 'outbox/<runId>.json'. It is not marked forwarded.
 ```
 
 Second live run, still down:
 
 ```
+📬 1 outbox run(s) pending (...). Those ids will be skipped. Pass --flush-outbox to POST the same runId.
+📋 Isolated 5 exception(s) into 'exceptions_for_consultant.json'
 ⏭️ Replay: skipped 6 mapped row(s) already in 'state/forwarded.json' or outbox.
 ⚠️ No valid Salesforce records to send to Superglue.
 ```

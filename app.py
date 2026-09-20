@@ -3,6 +3,7 @@ import os
 import json
 import re
 import time
+import uuid
 from pydantic import ValidationError
 from datetime import datetime, timezone
 
@@ -14,6 +15,7 @@ from handover import (
     deliver_payload,
     flush_outbox,
     outbox_files,
+    pending_run_ids,
     skip_ids,
 )
 
@@ -159,6 +161,7 @@ def tool_run_url() -> str:
 
 def build_handover_payload(accounts: list[dict], contacts: list[dict]) -> dict:
     return {
+        "runId": str(uuid.uuid4()),
         "inputs": {
             "Account": accounts,
             "Contact": contacts,
@@ -241,7 +244,12 @@ def main(
     if dry_run:
         print("🧪 Dry-run enabled: map and isolate exceptions, do not POST.")
     elif outbox_files():
-        flush_outbox(tool_run_url(), SUPERGLUE_API_KEY)
+        run_ids = pending_run_ids()
+        listed = ", ".join(run_ids)
+        print(
+            f"📬 {len(run_ids)} outbox run(s) pending ({listed}). "
+            "Those ids will be skipped. Pass --flush-outbox to POST the same runId."
+        )
 
     already = skip_ids()
     raw_rows = fetch_source_rows(selected, spec)
@@ -290,6 +298,10 @@ def main(
     payload = build_handover_payload(accounts, contacts)
     if dry_run:
         write_dry_run_payload(payload, len(raw_rows), len(accounts), len(exceptions))
+        return
+
+    if not accounts:
+        print("⚠️ No valid Salesforce records to send to Superglue.")
         return
 
     send_to_superglue(payload)

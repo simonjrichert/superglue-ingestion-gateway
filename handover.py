@@ -9,8 +9,9 @@ from pathlib import Path
 
 import requests
 
-OUTBOX_DIR = os.getenv("OUTBOX_DIR", "outbox")
-FORWARDED_FILE = os.getenv("FORWARDED_FILE", os.path.join("state", "forwarded.json"))
+_APP_DIR = Path(__file__).resolve().parent
+OUTBOX_DIR = os.getenv("OUTBOX_DIR", str(_APP_DIR / "outbox"))
+FORWARDED_FILE = os.getenv("FORWARDED_FILE", str(_APP_DIR / "state" / "forwarded.json"))
 
 
 def _ensure_dirs():
@@ -62,7 +63,22 @@ def outbox_files() -> list[Path]:
     folder = Path(OUTBOX_DIR)
     if not folder.is_dir():
         return []
-    return sorted(folder.glob("*.json"))
+    return sorted(
+        path for path in folder.iterdir()
+        if path.is_file() and path.suffix.lower() == ".json"
+    )
+
+
+def pending_run_ids() -> list[str]:
+    ids = []
+    for path in outbox_files():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            ids.append(path.stem)
+            continue
+        ids.append(str(payload.get("runId") or path.stem))
+    return ids
 
 
 def load_outbox_ids() -> set[str]:
@@ -83,7 +99,7 @@ def skip_ids() -> set[str]:
 
 def write_outbox(payload: dict) -> Path:
     _ensure_dirs()
-    batch_id = f"batch_{int(datetime.now(timezone.utc).timestamp())}"
+    batch_id = payload.get("runId") or f"batch_{int(datetime.now(timezone.utc).timestamp())}"
     path = Path(OUTBOX_DIR) / f"{batch_id}.json"
     path.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
     return path
@@ -101,9 +117,11 @@ def post_payload(payload: dict, url: str, api_key: str) -> tuple[bool, str]:
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
     }
+    run_id = payload.get("runId")
+    run_note = f" runId={run_id}" if run_id else ""
     print(
         f"🚀 Forwarding {len(accounts)} Salesforce Account(s) and "
-        f"{len(contacts)} Contact(s) to Superglue Engine ({url})..."
+        f"{len(contacts)} Contact(s) to Superglue Engine ({url}){run_note}..."
     )
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=5)
